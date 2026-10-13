@@ -3,3 +3,7 @@ npm-debug.log
 .git
 .gitignore
 README.md
+.env
+.env.*
+Dockerfile
+.dockerignore

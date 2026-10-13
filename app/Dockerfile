@@ -1,16 +1,37 @@
-FROM node:14
+# -----------------------------------------------------------------------------
+# Estágio 1 (deps): instala só as dependências de produção, exatamente as
+# versões do package-lock.json. Este estágio tem npm e shell, mas NÃO vai para
+# a imagem final.
+# -----------------------------------------------------------------------------
+FROM node:24-trixie-slim AS deps
 
 WORKDIR /app
 
-COPY package.json package-lock.json* ./
-RUN npm install --omit=dev
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev && npm cache clean --force
 
-COPY . .
+# -----------------------------------------------------------------------------
+# Estágio 2 (runtime): imagem distroless, que contém só o runtime do Node e as
+# bibliotecas mínimas do sistema. Sem shell, sem npm e sem gerenciador de
+# pacotes, sobra bem menos para ter CVE e para um atacante usar.
+#
+# Correção (Trivy): a base antiga node:14 (Debian 10, sem suporte desde 2023)
+# tinha 21 CVEs CRITICAL e 545 HIGH só nos pacotes do sistema.
+# -----------------------------------------------------------------------------
+FROM gcr.io/distroless/nodejs24-debian13:nonroot
+
+WORKDIR /app
+ENV NODE_ENV=production
+
+COPY --from=deps /app/node_modules ./node_modules
+COPY package.json ./
+COPY src ./src
+COPY uploads ./uploads
 
 EXPOSE 3000
 
-# Correção (Semgrep: missing-user): o processo roda com o usuário sem
-# privilégios "node", que já existe na imagem oficial, em vez de root
-USER node
+# Usuário sem privilégios (uid 65532) da imagem distroless
+USER nonroot
 
-CMD ["node", "src/server.js"]
+# O ENTRYPOINT da imagem distroless já é o binário do node
+CMD ["src/server.js"]
