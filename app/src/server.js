@@ -10,9 +10,15 @@ const PORT = process.env.PORT || 3000;
 
 app.use(express.json());
 
-// Healthcheck - usado pelo Render para saber se a aplicação está no ar.
+// Healthcheck - usado pelo Render para saber se a aplicação está no ar e pela
+// pipeline para confirmar que o deploy publicou o commit certo
+// (RENDER_GIT_COMMIT é definida pelo próprio Render a cada deploy).
 app.get("/health", (req, res) => {
-  res.json({ status: "ok", uptime: process.uptime() });
+  res.json({
+    status: "ok",
+    uptime: process.uptime(),
+    commit: process.env.RENDER_GIT_COMMIT || "local",
+  });
 });
 
 app.get("/", (req, res) => {

@@ -1,0 +1,27 @@
+# Configuração do Gitleaks (detecção de segredos)
+#
+# Usa TODAS as regras padrão do Gitleaks (chaves AWS, tokens do GitHub, chaves
+# privadas, etc.) e acrescenta uma regra própria.
+#
+# Por que uma regra própria? As regras padrão procuram formatos conhecidos de
+# credencial e textos de alta entropia (aleatórios). No código-base da trilha
+# elas não detectaram nada: a chave AWS é a de exemplo da documentação da AWS
+# (que o Gitleaks ignora de propósito) e o JWT secret é uma frase legível, de
+# baixa entropia. Mesmo assim os dois são credenciais em texto puro no código,
+# exatamente o que este gate precisa barrar.
+
+title = "Gitleaks - trilha DevSecOps SACI"
+
+[extend]
+useDefault = true
+
+# Qualquer variável/propriedade cujo nome indica credencial (SECRET, PASSWORD,
+# TOKEN, API_KEY, ACCESS_KEY, PRIVATE_KEY...) recebendo um texto literal de 12
+# ou mais caracteres. Ler de variável de ambiente (process.env.X) não casa,
+# porque não é um texto literal entre aspas.
+[[rules]]
+id = "hardcoded-credential-assignment"
+description = "Credencial atribuída como texto literal no código"
+regex = '''(?i)\b[a-z0-9_]*(?:secret|passw(?:or)?d|token|api_?key|access_?key(?:_?id)?|private_?key)[a-z0-9_]*["']?\s*[:=]\s*["']([^"'\s]{12,})["']'''
+secretGroup = 1
+keywords = ["secret", "passw", "token", "key"]
