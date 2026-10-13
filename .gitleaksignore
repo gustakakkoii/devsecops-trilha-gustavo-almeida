@@ -1,0 +1,17 @@
+# Achados do Gitleaks aceitos conscientemente (formato: commit:arquivo:regra:linha)
+#
+# Credenciais que estavam em app/src/config.js no commit que adicionou o
+# código-base da mentoria. Elas foram REMOVIDAS do código (agora vêm de
+# variáveis de ambiente) e tratadas como vazadas:
+#   - JWT secret: rotacionado; o valor novo foi gerado no Render e nunca
+#     passou pelo Git;
+#   - chaves AWS: são as chaves de exemplo da documentação da AWS (não dão
+#     acesso a nada) e foram removidas porque o app não usa AWS. Se fossem
+#     reais, deveriam ser revogadas no IAM antes de qualquer outra coisa.
+# Continuam no histórico porque reescrever o Git (git filter-repo / BFG)
+# exigiria force-push e não apagaria cópias já clonadas. Por isso a correção
+# de verdade é a rotação; aqui só registramos que esses achados antigos já
+# foram tratados.
+7bf5c58fa751addd36ee1892b57c6180dbe537d5:app/src/config.js:hardcoded-credential-assignment:2
+7bf5c58fa751addd36ee1892b57c6180dbe537d5:app/src/config.js:hardcoded-credential-assignment:3
+7bf5c58fa751addd36ee1892b57c6180dbe537d5:app/src/config.js:hardcoded-credential-assignment:4
