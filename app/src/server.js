@@ -25,7 +25,7 @@ app.get("/", (req, res) => {
       "POST /api/tasks",
       "PATCH /api/tasks/:id",
       "DELETE /api/tasks/:id",
-      "GET  /api/tasks/filter?expr=...",
+      "GET  /api/tasks/filter?done=...&owner=...&q=...",
       "GET  /api/ping?host=...",
       "GET  /api/files/:filename",
     ]),

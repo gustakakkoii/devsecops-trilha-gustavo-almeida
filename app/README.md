@@ -27,8 +27,8 @@ docker run -p 3000:3000 task-api
 | GET | `/api/tasks` | Lista todas as tarefas |
 | GET | `/api/tasks/:id` | Busca uma tarefa pelo id |
 | POST | `/api/tasks` | Cria uma nova tarefa (`{ "title": "...", "owner": "..." }`) |
-| PATCH | `/api/tasks/:id` | Atualiza uma tarefa |
+| PATCH | `/api/tasks/:id` | Atualiza uma tarefa (campos aceitos: `title`, `done`, `owner`) |
 | DELETE | `/api/tasks/:id` | Remove uma tarefa |
-| GET | `/api/tasks/filter?expr=...` | Filtro avançado de tarefas |
-| GET | `/api/ping?host=...` | Diagnóstico de rede |
+| GET | `/api/tasks/filter?done=true&owner=...&q=...` | Filtra tarefas por status, dono e texto do título |
+| GET | `/api/ping?host=...` | Diagnóstico de rede (resolve o host via DNS) |
 | GET | `/api/files/:filename` | Lê um arquivo da pasta `uploads/` |
