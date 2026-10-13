@@ -1,0 +1,432 @@
+# =============================================================================
+# Pipeline DevSecOps (Bloco 3)
+#
+# Roda automaticamente a cada push e pull request na branch main.
+#
+#   build ─────────────┐
+#   sast-semgrep ──────┤  (rodam em paralelo; cada gate falha o próprio job)
+#   sca-trivy ─────────┼──> deploy (só na main, só se TODOS passarem)
+#   secrets-gitleaks ──┘
+#
+#   1. build            -> npm ci, build da imagem Docker e smoke test (GET /health)
+#   2. sast-semgrep     -> SAST: achado ERROR/WARNING falha o job
+#   3. sca-trivy        -> SCA das dependências + misconfiguração do Dockerfile +
+#                          scan da imagem Docker: HIGH/CRITICAL com correção
+#                          disponível falha o job
+#   4. secrets-gitleaks -> segredos no código atual E em todo o histórico do
+#                          Git: qualquer achado falha o job
+#   5. deploy           -> dispara o deploy do commit no Render (Deploy Hook) e
+#                          espera a aplicação responder com o commit novo
+#
+# Boas práticas de segurança da própria pipeline:
+#   - actions de terceiros fixadas por SHA de commit (tag pode ser movida por
+#     um atacante; SHA não) com a versão em comentário
+#   - ferramentas em versão fixa; Trivy e Gitleaks baixados dos releases
+#     oficiais com verificação de SHA-256
+#   - GITHUB_TOKEN com permissão mínima (somente leitura)
+#   - a URL do Deploy Hook fica em um secret do GitHub, nunca no código
+# =============================================================================
+name: DevSecOps Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Etapa 1: build / instalação de dependências
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build & smoke test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - name: Checkout do código
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Configurar Node.js 24 (LTS)
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      # npm ci instala exatamente o que está no package-lock.json e falha se o
+      # lockfile estiver dessincronizado do package.json
+      - name: Instalar dependências (npm ci)
+        run: npm ci --omit=dev
+
+      - name: Build da imagem Docker
+        run: docker build --tag "task-api:${GITHUB_SHA}" .
+
+      - name: Smoke test do container (GET /health)
+        run: |
+          docker run --detach --name task-api --publish 3000:3000 "task-api:${GITHUB_SHA}"
+          for _ in $(seq 1 20); do
+            if curl --fail --silent http://localhost:3000/health; then
+              echo; echo "Container respondeu em /health"; exit 0
+            fi
+            sleep 1
+          done
+          echo "::error title=Smoke test::O container não respondeu em /health"
+          docker logs task-api
+          exit 1
+
+  # ---------------------------------------------------------------------------
+  # Etapa 2: SAST com Semgrep (gate de segurança)
+  # ---------------------------------------------------------------------------
+  sast-semgrep:
+    name: SAST · Semgrep
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      SEMGREP_VERSION: "1.179.0"
+    steps:
+      - name: Checkout do código
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Configurar Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Instalar Semgrep ${{ env.SEMGREP_VERSION }}
+        run: pip install "semgrep==${SEMGREP_VERSION}"
+
+      # --config p/default        -> ruleset padrão mantido pela Semgrep (JS, Dockerfile, YAML do Actions...)
+      # --severity ERROR/WARNING  -> só achados de severidade alta e média contam
+      # --error                   -> exit code 1 se houver achado: é isso que transforma o scan em gate
+      # --metrics off             -> não envia telemetria
+      - name: Semgrep scan (gate)
+        run: |
+          semgrep scan \
+            --config p/default \
+            --severity ERROR \
+            --severity WARNING \
+            --error \
+            --metrics off \
+            --json-output semgrep-results.json \
+            .
+
+      # Roda mesmo se o gate falhou: cria anotações no commit/PR (arquivo e
+      # linha de cada achado) e uma tabela no resumo da execução
+      - name: Publicar achados (anotações + resumo)
+        if: ${{ !cancelled() && hashFiles('semgrep-results.json') != '' }}
+        run: |
+          jq -r '.results[] | "::error file=\(.path),line=\(.start.line),endLine=\(.end.line),title=Semgrep \(.extra.severity) - \(.check_id | split(".") | last)::\(.extra.message | gsub("%"; "%25") | gsub("[\\r\\n]+"; " "))"' semgrep-results.json
+
+          total=$(jq '.results | length' semgrep-results.json)
+          {
+            echo "## SAST · Semgrep"
+            echo
+            echo "Ruleset \`p/default\` · Semgrep \`${SEMGREP_VERSION}\` · severidades bloqueantes: **ERROR** e **WARNING**"
+            echo
+            if [ "$total" -eq 0 ]; then
+              echo "✅ **Nenhum achado bloqueante.** Gate liberado."
+            else
+              echo "❌ **${total} achado(s) bloqueante(s).** O gate falhou a pipeline."
+              echo
+              echo "| Severidade | Regra | Local | Descrição |"
+              echo "| :--- | :--- | :--- | :--- |"
+              jq -r '.results[] | "| \(.extra.severity) | `\(.check_id | split(".") | last)` | `\(.path):\(.start.line)` | \(.extra.message | gsub("[\\r\\n]+"; " ") | gsub("\\|"; "\\\\|") | .[0:220]) |"' semgrep-results.json
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Guardar relatório completo (artefato)
+        if: ${{ !cancelled() && hashFiles('semgrep-results.json') != '' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: semgrep-results
+          path: semgrep-results.json
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # Etapa 3: SCA e scan de container com Trivy (gate de segurança)
+  # ---------------------------------------------------------------------------
+  sca-trivy:
+    name: SCA & Container · Trivy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      TRIVY_VERSION: "0.75.0"
+      # SHA-256 oficial de trivy_0.75.0_Linux-64bit.tar.gz (trivy_0.75.0_checksums.txt)
+      TRIVY_SHA256: "c6e65abddb348e25f10549df887045629cf28cc72453cd1c63acb717316b3f3f"
+    steps:
+      - name: Checkout do código
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Binário oficial em versão fixa, com checksum conferido. Em março de 2026
+      # o trivy-action e o próprio Trivy (v0.69.4) foram comprometidos num ataque
+      # de supply chain; fixar versão + hash impede que um artefato trocado rode aqui.
+      - name: Instalar Trivy ${{ env.TRIVY_VERSION }} (binário oficial + SHA-256)
+        run: |
+          file="trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          curl -sSfL -o "$file" "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/${file}"
+          echo "${TRIVY_SHA256}  ${file}" | sha256sum --check --strict
+          tar -xzf "$file" trivy
+          sudo install -m 0755 trivy /usr/local/bin/trivy
+          rm -f "$file" trivy
+          trivy --version
+
+      # SCA: compara as versões do package-lock.json com as bases de CVEs.
+      # misconfig: verifica más práticas no Dockerfile (ex.: rodar como root).
+      # Gate: HIGH/CRITICAL que já têm versão corrigida (--ignore-unfixed) => exit 1
+      - name: SCA · dependências e Dockerfile (gate)
+        run: |
+          if ! trivy fs --scanners vuln,misconfig --severity HIGH,CRITICAL --ignore-unfixed \
+                --exit-code 1 --no-progress app/; then
+            echo "::error title=Trivy - SCA::Dependências ou Dockerfile do app com achados HIGH/CRITICAL corrigíveis (detalhes no log e no resumo)"
+            exit 1
+          fi
+
+      - name: Build da imagem Docker
+        if: ${{ !cancelled() }}
+        run: docker build --tag "task-api:${GITHUB_SHA}" app
+
+      # Scan da imagem: pacotes do sistema operacional da imagem base + bibliotecas
+      # que foram para dentro dela. Mesmo critério de gate.
+      - name: Container · imagem Docker (gate)
+        if: ${{ !cancelled() }}
+        run: |
+          if ! trivy image --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed \
+                --exit-code 1 --no-progress "task-api:${GITHUB_SHA}"; then
+            echo "::error title=Trivy - imagem::A imagem Docker tem vulnerabilidades HIGH/CRITICAL corrigíveis (detalhes no log e no resumo)"
+            exit 1
+          fi
+
+      # Relatório com TODAS as severidades (inclusive as sem correção), para
+      # nada ficar escondido: o gate decide, o relatório informa
+      - name: Publicar relatório completo (anotações + resumo)
+        if: ${{ !cancelled() }}
+        run: |
+          trivy fs --scanners vuln,misconfig --format json --output trivy-sca.json --no-progress app/
+          if docker image inspect "task-api:${GITHUB_SHA}" > /dev/null 2>&1; then
+            trivy image --scanners vuln --format json --output trivy-image.json --no-progress "task-api:${GITHUB_SHA}"
+          fi
+
+          # Uma anotação por dependência vulnerável corrigível, apontando o lockfile
+          jq -r '.Results[]? | select(.Class == "lang-pkgs") | .Target as $t | .Vulnerabilities[]?
+                 | select((.Severity == "CRITICAL" or .Severity == "HIGH") and (.FixedVersion // "") != "")
+                 | "::error file=app/\($t),title=Trivy \(.Severity) - \(.PkgName) \(.InstalledVersion)::\(.VulnerabilityID) \(.Title // "" | gsub("%"; "%25") | gsub("[\\r\\n]+"; " ")) (corrigido em \(.FixedVersion))"' trivy-sca.json
+
+          table() {
+            rows=$(jq -r '.Results[]? | select(.Vulnerabilities != null)
+                   | . as $r | [.Vulnerabilities[].Severity] as $s
+                   | "| `\($r.Target)` | \($r.Type) | \($s | map(select(. == "CRITICAL")) | length) | \($s | map(select(. == "HIGH")) | length) | \($s | map(select(. == "MEDIUM")) | length) | \($s | map(select(. == "LOW")) | length) |"' "$1")
+            if [ -n "$rows" ]; then
+              echo "| Alvo | Tipo | CRITICAL | HIGH | MEDIUM | LOW |"
+              echo "| :--- | :--- | ---: | ---: | ---: | ---: |"
+              echo "$rows"
+            else
+              echo "Nenhuma vulnerabilidade encontrada, de nenhuma severidade."
+            fi
+            n=$(jq '[.Results[]?.Vulnerabilities[]? | select((.Severity == "CRITICAL" or .Severity == "HIGH") and (.FixedVersion // "") != "")] | length' "$1")
+            echo
+            if [ "$n" -eq 0 ]; then
+              echo "✅ Nenhuma vulnerabilidade HIGH/CRITICAL com correção disponível."
+            else
+              echo "❌ **${n}** vulnerabilidade(s) HIGH/CRITICAL com correção disponível (até 15 listadas):"
+              echo
+              echo "| Severidade | CVE | Pacote | Instalado | Corrigido em |"
+              echo "| :--- | :--- | :--- | :--- | :--- |"
+              jq -r '[.Results[]?.Vulnerabilities[]? | select((.Severity == "CRITICAL" or .Severity == "HIGH") and (.FixedVersion // "") != "")]
+                     | sort_by(.Severity) | .[0:15][]
+                     | "| \(.Severity) | \(.VulnerabilityID) | `\(.PkgName)` | \(.InstalledVersion) | \(.FixedVersion) |"' "$1"
+            fi
+            echo
+          }
+
+          {
+            echo "## SCA & Container · Trivy"
+            echo
+            echo "Trivy \`${TRIVY_VERSION}\` · gate: **HIGH** e **CRITICAL** com correção disponível"
+            echo
+            echo "### Dependências do app (\`app/package-lock.json\`)"
+            echo
+            table trivy-sca.json
+            misconf=$(jq '[.Results[]?.Misconfigurations[]? | select(.Status == "FAIL")] | length' trivy-sca.json)
+            misconf_hc=$(jq '[.Results[]?.Misconfigurations[]? | select(.Status == "FAIL" and (.Severity == "HIGH" or .Severity == "CRITICAL"))] | length' trivy-sca.json)
+            echo "**Misconfiguração no Dockerfile:** ${misconf} falha(s), sendo ${misconf_hc} HIGH/CRITICAL."
+            echo
+            if [ -f trivy-image.json ]; then
+              echo "### Imagem Docker (\`$(jq -r '.Metadata.OS.Family + " " + .Metadata.OS.Name' trivy-image.json)\`)"
+              echo
+              table trivy-image.json
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ -f trivy-image.json ]; then
+            jq -r '[.Results[]?.Vulnerabilities[]? | select((.Severity == "CRITICAL" or .Severity == "HIGH") and (.FixedVersion // "") != "")] as $v
+                   | select(($v | length) > 0)
+                   | "::error title=Trivy - imagem (\(.Metadata.OS.Family) \(.Metadata.OS.Name))::\($v | map(select(.Severity == "CRITICAL")) | length) CRITICAL e \($v | map(select(.Severity == "HIGH")) | length) HIGH com correção disponível"' trivy-image.json
+          fi
+
+      - name: Guardar relatórios completos (artefato)
+        if: ${{ !cancelled() && hashFiles('trivy-sca.json') != '' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: trivy-results
+          path: trivy-*.json
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # Etapa 4: detecção de segredos com Gitleaks (gate de segurança)
+  # ---------------------------------------------------------------------------
+  secrets-gitleaks:
+    name: Segredos · Gitleaks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      GITLEAKS_VERSION: "8.30.1"
+      # SHA-256 oficial de gitleaks_8.30.1_linux_x64.tar.gz (gitleaks_8.30.1_checksums.txt)
+      GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+    steps:
+      # fetch-depth: 0 baixa TODOS os commits. Sem isso o checkout traz só o
+      # último commit e um segredo commitado no passado passaria despercebido.
+      - name: Checkout do código (histórico completo)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Instalar Gitleaks ${{ env.GITLEAKS_VERSION }} (binário oficial + SHA-256)
+        run: |
+          file="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -sSfL -o "$file" "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${file}"
+          echo "${GITLEAKS_SHA256}  ${file}" | sha256sum --check --strict
+          tar -xzf "$file" gitleaks
+          sudo install -m 0755 gitleaks /usr/local/bin/gitleaks
+          rm -f "$file" gitleaks
+          gitleaks version
+
+      # As regras vêm de .gitleaks.toml (regras padrão + regra própria) e os
+      # achados antigos já tratados ficam em .gitleaksignore. --redact esconde o
+      # valor do segredo no log (o log é público!).
+      - name: Código atual (todos os arquivos) (gate)
+        run: gitleaks dir . --no-banner --redact --verbose --report-format json --report-path gitleaks-dir.json
+
+      - name: Histórico completo do Git (todos os commits) (gate)
+        if: ${{ !cancelled() }}
+        run: gitleaks git . --no-banner --redact --verbose --report-format json --report-path gitleaks-git.json
+
+      - name: Publicar achados (anotações + resumo)
+        if: ${{ !cancelled() }}
+        run: |
+          {
+            echo "## Segredos · Gitleaks"
+            echo
+            echo "Gitleaks \`${GITLEAKS_VERSION}\` · regras padrão + \`hardcoded-credential-assignment\` · qualquer achado bloqueia"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          for scan in dir git; do
+            report="gitleaks-${scan}.json"
+            [ -f "$report" ] || continue
+            if [ "$scan" = "dir" ]; then label="Código atual"; else label="Histórico do Git ($(git rev-list --count HEAD) commits)"; fi
+
+            jq -r '.[] | "::error file=\(.File),line=\(.StartLine),title=Gitleaks - \(.RuleID)::\(.Description)\(if .Commit != "" then " (commit \(.Commit[0:7]) de \(.Date[0:10]))" else " (código atual)" end)"' "$report"
+
+            total=$(jq 'length' "$report")
+            {
+              echo "### ${label}"
+              echo
+              if [ "$total" -eq 0 ]; then
+                echo "✅ Nenhum segredo encontrado."
+              else
+                echo "❌ **${total} segredo(s) encontrado(s).**"
+                echo
+                echo "| Regra | Arquivo:linha | Commit | Data |"
+                echo "| :--- | :--- | :--- | :--- |"
+                jq -r '.[] | "| `\(.RuleID)` | `\(.File):\(.StartLine)` | \(if .Commit != "" then "`\(.Commit[0:7])`" else "—" end) | \(if .Date != "" then .Date[0:10] else "—" end) |"' "$report"
+              fi
+              echo
+            } >> "$GITHUB_STEP_SUMMARY"
+          done
+
+  # ---------------------------------------------------------------------------
+  # Etapa 5: deploy automático no Render (gate final)
+  #
+  # needs: só começa se TODOS os jobs anteriores passarem. Se qualquer gate
+  # falhar, este job é pulado (skipped) e nada vai para produção.
+  # if: só faz deploy a partir da main (push ou execução manual), nunca em PR.
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: Deploy · Render
+    needs: [build, sast-semgrep, sca-trivy, secrets-gitleaks]
+    if: ${{ github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    environment:
+      name: production
+      url: https://devsecops-trilha-gustavo-almeida.onrender.com
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    env:
+      APP_URL: https://devsecops-trilha-gustavo-almeida.onrender.com
+    steps:
+      # O Deploy Hook é uma URL secreta do Render que dispara um deploy. O
+      # parâmetro ref=<SHA> faz o Render publicar exatamente o commit que passou
+      # pelos gates (e não "o que estiver na main agora").
+      - name: Disparar deploy no Render (Deploy Hook)
+        env:
+          RENDER_DEPLOY_HOOK_URL: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
+        run: |
+          if [ -z "${RENDER_DEPLOY_HOOK_URL}" ]; then
+            echo "::error title=Deploy::O secret RENDER_DEPLOY_HOOK_URL não está configurado no repositório"
+            exit 1
+          fi
+          status=$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
+                     --request POST "${RENDER_DEPLOY_HOOK_URL}&ref=${GITHUB_SHA}")
+          echo "Render respondeu HTTP ${status}"
+          case "$status" in
+            200|202) echo "Deploy do commit ${GITHUB_SHA} solicitado ao Render" ;;
+            *) echo "::error title=Deploy::O Render recusou o pedido de deploy (HTTP ${status})"; exit 1 ;;
+          esac
+
+      # O Render builda a imagem a partir do Dockerfile e troca a versão no ar.
+      # No plano Free isso leva alguns minutos e, se o serviço estiver hibernado,
+      # a primeira resposta demora ~1 min (cold start). Por isso a verificação
+      # tenta por até 20 minutos antes de desistir.
+      - name: Verificar publicação (aguarda /health responder com o commit novo)
+        run: |
+          deadline=$((SECONDS + 1200))
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            live=$(curl --silent --max-time 90 "${APP_URL}/health" | jq -r '.commit // empty' 2>/dev/null || true)
+            if [ "$live" = "$GITHUB_SHA" ]; then
+              echo "Aplicação no ar com o commit ${GITHUB_SHA}"
+              {
+                echo "## Deploy · Render"
+                echo
+                echo "✅ Commit \`${GITHUB_SHA}\` publicado e respondendo em ${APP_URL}/health"
+              } >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            echo "Versão no ar: '${live:-sem resposta}'. Aguardando o deploy de ${GITHUB_SHA:0:7}..."
+            sleep 20
+          done
+          echo "::error title=Deploy::Tempo esgotado: ${APP_URL}/health não passou a responder com o commit ${GITHUB_SHA}"
+          exit 1

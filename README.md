@@ -9,6 +9,16 @@ Ao longo da trilha este repositório evolui de um código-base vulnerável até 
 dependências e de container (SCA), detecção de segredos e deploy automático —
 tudo rodando a cada `push`, no espírito de *shift-left security*.
 
+**Aplicação publicada:** https://devsecops-trilha-gustavo-almeida.onrender.com
+(plano Free do Render: depois de 15 min sem acesso o serviço hiberna e a primeira requisição leva cerca de 1 min)
+
+```
+push/PR ─► Build ─┐
+          Semgrep ┤
+          Trivy ──┼─► Deploy no Render (só na main, só se todos os gates passarem)
+          Gitleaks┘
+```
+
 ## Estrutura
 
 | Pasta | Conteúdo | Bloco |
