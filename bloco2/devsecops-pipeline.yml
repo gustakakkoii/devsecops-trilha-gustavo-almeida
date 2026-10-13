@@ -1,0 +1,150 @@
+# =============================================================================
+# Pipeline DevSecOps (Bloco 2)
+#
+# Roda automaticamente a cada push e pull request na branch main.
+#   1. build        -> instala as dependências, builda a imagem Docker e faz um
+#                      smoke test no container (GET /health)
+#   2. sast-semgrep -> SAST com Semgrep, configurado como GATE: se houver achado
+#                      de severidade ERROR ou WARNING o job falha (pipeline
+#                      vermelha) e o merge fica bloqueado
+#
+# Boas práticas de segurança da própria pipeline:
+#   - actions de terceiros fixadas por SHA de commit (tag pode ser movida por
+#     um atacante; SHA não) com a versão em comentário
+#   - GITHUB_TOKEN com permissão mínima (somente leitura)
+#   - versão do Semgrep fixada, para o resultado ser reproduzível
+# =============================================================================
+name: DevSecOps Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Etapa 1: build / instalação de dependências
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build & smoke test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - name: Checkout do código
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Configurar Node.js 24 (LTS)
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      # npm ci instala exatamente o que está no package-lock.json e falha se o
+      # lockfile estiver dessincronizado do package.json
+      - name: Instalar dependências (npm ci)
+        run: npm ci --omit=dev
+
+      - name: Build da imagem Docker
+        run: docker build --tag "task-api:${GITHUB_SHA}" .
+
+      - name: Smoke test do container (GET /health)
+        run: |
+          docker run --detach --name task-api --publish 3000:3000 "task-api:${GITHUB_SHA}"
+          for _ in $(seq 1 20); do
+            if curl --fail --silent http://localhost:3000/health; then
+              echo; echo "Container respondeu em /health"; exit 0
+            fi
+            sleep 1
+          done
+          echo "::error title=Smoke test::O container não respondeu em /health"
+          docker logs task-api
+          exit 1
+
+  # ---------------------------------------------------------------------------
+  # Etapa 2: SAST com Semgrep (gate de segurança)
+  # ---------------------------------------------------------------------------
+  sast-semgrep:
+    name: SAST · Semgrep
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      SEMGREP_VERSION: "1.179.0"
+    steps:
+      - name: Checkout do código
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Configurar Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Instalar Semgrep ${{ env.SEMGREP_VERSION }}
+        run: pip install "semgrep==${SEMGREP_VERSION}"
+
+      # --config p/default        -> ruleset padrão mantido pela Semgrep (JS, Dockerfile, YAML do Actions...)
+      # --severity ERROR/WARNING  -> só achados de severidade alta e média contam
+      # --error                   -> exit code 1 se houver achado: é isso que transforma o scan em gate
+      # --metrics off             -> não envia telemetria
+      - name: Semgrep scan (gate)
+        run: |
+          semgrep scan \
+            --config p/default \
+            --severity ERROR \
+            --severity WARNING \
+            --error \
+            --metrics off \
+            --json-output semgrep-results.json \
+            .
+
+      # Roda mesmo se o gate falhou: cria anotações no commit/PR (arquivo e
+      # linha de cada achado) e uma tabela no resumo da execução
+      - name: Publicar achados (anotações + resumo)
+        if: ${{ !cancelled() && hashFiles('semgrep-results.json') != '' }}
+        run: |
+          jq -r '.results[] | "::error file=\(.path),line=\(.start.line),endLine=\(.end.line),title=Semgrep \(.extra.severity) - \(.check_id | split(".") | last)::\(.extra.message | gsub("%"; "%25") | gsub("[\\r\\n]+"; " "))"' semgrep-results.json
+
+          total=$(jq '.results | length' semgrep-results.json)
+          {
+            echo "## SAST · Semgrep"
+            echo
+            echo "Ruleset \`p/default\` · Semgrep \`${SEMGREP_VERSION}\` · severidades bloqueantes: **ERROR** e **WARNING**"
+            echo
+            if [ "$total" -eq 0 ]; then
+              echo "✅ **Nenhum achado bloqueante.** Gate liberado."
+            else
+              echo "❌ **${total} achado(s) bloqueante(s).** O gate falhou a pipeline."
+              echo
+              echo "| Severidade | Regra | Local | Descrição |"
+              echo "| :--- | :--- | :--- | :--- |"
+              jq -r '.results[] | "| \(.extra.severity) | `\(.check_id | split(".") | last)` | `\(.path):\(.start.line)` | \(.extra.message | gsub("[\\r\\n]+"; " ") | gsub("\\|"; "\\\\|") | .[0:220]) |"' semgrep-results.json
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Guardar relatório completo (artefato)
+        if: ${{ !cancelled() && hashFiles('semgrep-results.json') != '' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: semgrep-results
+          path: semgrep-results.json
+          retention-days: 30

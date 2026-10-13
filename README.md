@@ -1,5 +1,7 @@
 # devsecops-trilha-gustavo-almeida
 
+[![DevSecOps Pipeline](https://github.com/gustakakkoii/devsecops-trilha-gustavo-almeida/actions/workflows/devsecops-pipeline.yml/badge.svg?branch=main)](https://github.com/gustakakkoii/devsecops-trilha-gustavo-almeida/actions/workflows/devsecops-pipeline.yml)
+
 Repositório de entregas da **Trilha de DevSecOps — Onboarding SACI/UFLA 2026.2**.
 
 Ao longo da trilha este repositório evolui de um código-base vulnerável até uma
